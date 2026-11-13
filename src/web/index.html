@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Room monitor</title>
+  <title>SHT30 Monitor</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #101820; color: #eff5f8; }
     * { box-sizing: border-box; }
@@ -11,12 +11,12 @@
     main { max-width: 760px; margin: auto; }
     .eyebrow { color: #9eafbd; text-transform: uppercase; letter-spacing: .16em; font-size: .75rem; }
     h1 { font-size: clamp(2rem, 6vw, 3rem); margin: 12px 0; }
-    .intro, footer { color: #afbeca; line-height: 1.6; }
+    footer { color: #afbeca; line-height: 1.6; }
     .cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; margin: 32px 0; }
     article { border: 1px solid #344250; background: #192530; border-radius: 18px; padding: 28px; }
     h2 { font-size: 1rem; font-weight: 500; margin: 0 0 20px; }
-    .value { font-size: clamp(2.3rem, 7vw, 3.8rem); font-variant-numeric: tabular-nums; font-weight: 650; }
-    .unit { font-size: 1.25rem; color: #afbeca; }
+    .value { font-size: clamp(2rem, 6vw, 3.2rem); font-variant-numeric: tabular-nums; font-weight: 650; }
+    .unit { font-size: 1.1rem; color: #afbeca; }
     .temperature { color: #f2a3df; }
     .humidity { color: #80dfeb; }
     #status { color: #efca7c; }
@@ -24,14 +24,23 @@
     #status[data-state="error"] { color: #ffab9e; }
     body.stale .value { opacity: .45; }
     footer { font-size: .85rem; }
+    .feedback { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-top: 20px; }
+    .feedback p { margin: 0; }
+    .history { margin-top: 32px; }
+    .history-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+    .history-bar h2 { margin: 0; }
+    select { background: #192530; color: #eff5f8; border: 1px solid #667987; border-radius: 8px; padding: 8px; font: inherit; }
+    .chart { margin-top: 18px; padding: 20px 12px 12px; }
+    .chart h2 { margin-left: 12px; margin-bottom: 8px; }
+    svg { display: block; width: 100%; height: auto; overflow: visible; }
+    .history-note { color: #afbeca; font-size: .85rem; line-height: 1.6; }
     @media (max-width: 480px) { .cards { grid-template-columns: 1fr; } body { padding-top: 28px; } }
   </style>
 </head>
 <body>
   <main>
     <div class="eyebrow">ESP32 · SHT30</div>
-    <h1>Room monitor</h1>
-    <p class="intro">Temperature and relative humidity, updated every two seconds.</p>
+    <h1>SHT30 Monitor</h1>
     <div class="cards">
       <article>
         <h2>Temperature</h2>
@@ -42,8 +51,32 @@
         <span id="humidity" class="value humidity">—</span> <span class="unit">% RH</span>
       </article>
     </div>
-    <p id="status" role="status" aria-live="polite">Connecting to sensor…</p>
-    <footer id="updated">Waiting for the first reading.</footer>
+    <section class="history" aria-labelledby="history-title">
+      <div class="history-bar">
+        <h2 id="history-title">Recent history</h2>
+        <label>Show <select id="time-range">
+          <option value="5">Last 5 minutes</option>
+          <option value="15" selected>Last 15 minutes</option>
+          <option value="30">Last 30 minutes</option>
+          <option value="60">Last hour</option>
+          <option value="360">Last 6 hours</option>
+          <option value="1440">Last 24 hours</option>
+        </select></label>
+      </div>
+      <article class="chart">
+        <h2 class="temperature">Temperature · °C</h2>
+        <svg id="temperature-chart" viewBox="0 0 680 280" role="img" aria-label="Temperature history, waiting for readings"></svg>
+      </article>
+      <article class="chart">
+        <h2 class="humidity">Relative humidity · % RH</h2>
+        <svg id="humidity-chart" viewBox="0 0 680 280" role="img" aria-label="Relative humidity history, waiting for readings"></svg>
+      </article>
+    </section>
+    <footer class="feedback">
+      <p id="status" role="status" aria-live="polite">Connecting to sensor…</p>
+      <p id="updated">Waiting for the first reading.</p>
+    </footer>
+    <p id="history-status" class="history-note" role="status">Loading stored history…</p>
     <noscript>Enable JavaScript to display live readings.</noscript>
   </main>
   <script>
@@ -51,6 +84,95 @@
     const humidity = document.getElementById('humidity');
     const status = document.getElementById('status');
     const updated = document.getElementById('updated');
+    const timeRange = document.getElementById('time-range');
+    let history = [];
+    const retentionMs = 24 * 60 * 60 * 1000;
+    const historyStatus = document.getElementById('history-status');
+
+    function drawChart(id, key, color, label, now) {
+      const chart = document.getElementById(id);
+      const start = now - Number(timeRange.value) * 60 * 1000;
+      const points = history.filter(point => point.time >= start);
+      const values = points.map(point => point[key]);
+      const minimum = values.length ? Math.min(...values) : 0;
+      const maximum = values.length ? Math.max(...values) : 1;
+      const padding = Math.max((maximum - minimum) * 0.15, 0.5);
+      const low = Math.floor((minimum - padding) * 10) / 10;
+      const high = Math.ceil((maximum + padding) * 10) / 10;
+      const x = time => 62 + (time - start) / (now - start) * 598;
+      const y = value => 230 - (value - low) / (high - low) * 210;
+      let markup = '';
+      for (let i = 0; i <= 4; i++) {
+        const level = low + (high - low) * i / 4;
+        const position = y(level);
+        markup += `<line x1="62" y1="${position}" x2="660" y2="${position}" stroke="#344250"/>`;
+        markup += `<text x="52" y="${position + 4}" fill="#afbeca" text-anchor="end" font-size="12">${level.toFixed(1)}</text>`;
+      }
+      for (let i = 0; i <= 2; i++) {
+        const time = start + (now - start) * i / 2;
+        const date = new Date(time);
+        const stamp = [date.getHours(), date.getMinutes(), date.getSeconds()].map(n => String(n).padStart(2, '0')).join(':');
+        markup += `<text x="${x(time)}" y="260" fill="#afbeca" text-anchor="${i === 0 ? 'start' : i === 2 ? 'end' : 'middle'}" font-size="12">${stamp}</text>`;
+      }
+      let path = '';
+      points.forEach((point, index) => {
+        const gap = index === 0 || point.time - points[index - 1].time > 90000;
+        path += `${gap ? 'M' : 'L'}${x(point.time).toFixed(2)},${y(point[key]).toFixed(2)} `;
+      });
+      markup += `<path d="${path}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round"/>`;
+      if (points.length) {
+        const last = points[points.length - 1];
+        markup += `<circle cx="${x(last.time)}" cy="${y(last[key])}" r="3" fill="${color}"/>`;
+      } else {
+        markup += '<text x="360" y="125" fill="#afbeca" text-anchor="middle" font-size="14">Waiting for readings…</text>';
+      }
+      chart.innerHTML = markup;
+      chart.setAttribute('aria-label', values.length
+        ? `${label}: ${points.length} readings, minimum ${minimum.toFixed(2)}, maximum ${maximum.toFixed(2)}`
+        : `${label}: waiting for readings`);
+    }
+
+    function drawHistory() {
+      const now = Date.now();
+      while (history.length && history[0].time < now - retentionMs) history.shift();
+      drawChart('temperature-chart', 'temperature', '#f2a3df', 'Temperature in degrees Celsius', now);
+      drawChart('humidity-chart', 'humidity', '#80dfeb', 'Relative humidity in percent', now);
+    }
+
+    timeRange.addEventListener('change', drawHistory);
+    drawHistory();
+
+    async function refreshHistory() {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      let retryMs = 5000;
+      try {
+        const response = await fetch('/api/history', { cache: 'no-store', signal: controller.signal });
+        if (!response.ok) throw new Error('History unavailable');
+        const data = await response.json();
+        if (!Array.isArray(data.samples) || data.samples.length > 1440 ||
+            !data.samples.every(row => Array.isArray(row) && row.length === 3 &&
+              row.every(Number.isFinite) && row[0] >= 0 && row[0] < 86400)) {
+          throw new Error('Invalid history');
+        }
+        const now = Date.now();
+        history = data.samples.map(([ageSeconds, temperature, humidity]) => ({
+          time: now - ageSeconds * 1000, temperature, humidity
+        })).sort((a, b) => a.time - b.time);
+        historyStatus.textContent = history.length
+          ? ''
+          : 'Waiting for the first stored reading…';
+        historyStatus.hidden = history.length > 0;
+        retryMs = 60000;
+      } catch (error) {
+        historyStatus.textContent = 'History update failed — showing previously loaded data. Retrying…';
+        historyStatus.hidden = false;
+      } finally {
+        clearTimeout(timeout);
+        drawHistory();
+        setTimeout(refreshHistory, retryMs);
+      }
+    }
 
     async function refresh() {
       const controller = new AbortController();
@@ -62,7 +184,7 @@
         if (![data.temperature_c, data.humidity_pct, data.age_ms].every(Number.isFinite)) {
           throw new Error('Invalid readings');
         }
-        if (data.age_ms > 6000) throw new Error('Sensor readings are stale');
+        if (data.age_ms < 0 || data.age_ms > 6000) throw new Error('Sensor readings are stale');
         temperature.textContent = data.temperature_c.toFixed(2);
         humidity.textContent = data.humidity_pct.toFixed(2);
         status.textContent = '● Live';
@@ -74,11 +196,13 @@
         status.dataset.state = 'error';
         document.body.classList.add('stale');
       } finally {
+        drawHistory();
         clearTimeout(timeout);
         setTimeout(refresh, 2000);
       }
     }
     refresh();
+    refreshHistory();
   </script>
 </body>
 </html>

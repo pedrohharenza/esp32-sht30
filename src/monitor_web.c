@@ -2,6 +2,8 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "esp_http_server.h"
 #include "esp_timer.h"
@@ -16,6 +18,22 @@ static float latest_humidity;
 static int64_t sample_time_us;
 static bool sample_available;
 
+#define HISTORY_CAPACITY 1440
+#define HISTORY_INTERVAL_SECONDS 60
+#define HISTORY_RETENTION_SECONDS (24 * 60 * 60)
+
+typedef struct {
+    uint32_t uptime_seconds;
+    float temperature_c;
+    float humidity_pct;
+} history_sample_t;
+
+// About 17 KB in RAM; populated by the sensor task even without HTTP clients.
+static history_sample_t history[HISTORY_CAPACITY];
+static size_t history_next;
+static size_t history_count;
+static uint32_t last_history_seconds;
+
 void monitor_web_update(float temperature_c, float humidity_pct)
 {
     int64_t now = esp_timer_get_time();
@@ -24,6 +42,17 @@ void monitor_web_update(float temperature_c, float humidity_pct)
     latest_humidity = humidity_pct;
     sample_time_us = now;
     sample_available = true;
+    uint32_t seconds = (uint32_t)(now / 1000000);
+    if (history_count == 0 || seconds - last_history_seconds >= HISTORY_INTERVAL_SECONDS) {
+        history[history_next] = (history_sample_t) {
+            .uptime_seconds = seconds,
+            .temperature_c = temperature_c,
+            .humidity_pct = humidity_pct,
+        };
+        history_next = (history_next + 1) % HISTORY_CAPACITY;
+        if (history_count < HISTORY_CAPACITY) ++history_count;
+        last_history_seconds = seconds;
+    }
     portEXIT_CRITICAL(&sample_lock);
 }
 
@@ -61,6 +90,56 @@ static esp_err_t readings_handler(httpd_req_t *request)
     return httpd_resp_send(request, response, length);
 }
 
+static esp_err_t history_handler(httpd_req_t *request)
+{
+    // Snapshot before sending: never hold the sensor lock during network I/O.
+    history_sample_t *snapshot = malloc(sizeof(history));
+    if (snapshot == NULL) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "History temporarily unavailable");
+    }
+    portENTER_CRITICAL(&sample_lock);
+    size_t count = history_count;
+    size_t oldest = (history_next + HISTORY_CAPACITY - count) % HISTORY_CAPACITY;
+    for (size_t i = 0; i < count; ++i) {
+        snapshot[i] = history[(oldest + i) % HISTORY_CAPACITY];
+    }
+    portEXIT_CRITICAL(&sample_lock);
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000);
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    esp_err_t result = httpd_resp_sendstr_chunk(request,
+        "{\"interval_seconds\":60,\"samples\":[");
+    // Batch records to avoid one TCP write per sample on a full day's history.
+    char chunk[1024];
+    size_t used = 0;
+    bool first = true;
+    for (size_t i = 0; result == ESP_OK && i < count; ++i) {
+        uint32_t age = now - snapshot[i].uptime_seconds;
+        if (age >= HISTORY_RETENTION_SECONDS) continue;
+        char record[96];
+        int length = snprintf(record, sizeof(record), "%s[%lu,%.2f,%.2f]",
+            first ? "" : ",", (unsigned long)age,
+            (double)snapshot[i].temperature_c, (double)snapshot[i].humidity_pct);
+        if (length < 0 || length >= (int)sizeof(record)) {
+            result = ESP_FAIL;
+            break;
+        }
+        if (used + (size_t)length > sizeof(chunk)) {
+            result = httpd_resp_send_chunk(request, chunk, used);
+            used = 0;
+        }
+        if (result != ESP_OK) break;
+        for (int j = 0; j < length; ++j) chunk[used++] = record[j];
+        first = false;
+    }
+    free(snapshot);
+    if (result == ESP_OK && used > 0) result = httpd_resp_send_chunk(request, chunk, used);
+    if (result == ESP_OK) result = httpd_resp_sendstr_chunk(request, "]}");
+    if (result == ESP_OK) result = httpd_resp_send_chunk(request, NULL, 0);
+    return result;
+}
+
 esp_err_t monitor_web_start(void)
 {
     // The Wi-Fi event loop calls this again after reconnection.
@@ -80,9 +159,15 @@ esp_err_t monitor_web_start(void)
     const httpd_uri_t readings = {
         .uri = "/api/readings", .method = HTTP_GET, .handler = readings_handler,
     };
+    const httpd_uri_t stored_history = {
+        .uri = "/api/history", .method = HTTP_GET, .handler = history_handler,
+    };
     result = httpd_register_uri_handler(server, &page);
     if (result == ESP_OK) {
         result = httpd_register_uri_handler(server, &readings);
+    }
+    if (result == ESP_OK) {
+        result = httpd_register_uri_handler(server, &stored_history);
     }
     if (result != ESP_OK) {
         httpd_stop(server);
