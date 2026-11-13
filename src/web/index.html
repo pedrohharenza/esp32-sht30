@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Room monitor</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #101820; color: #eff5f8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 48px 20px; }
+    main { max-width: 760px; margin: auto; }
+    .eyebrow { color: #9eafbd; text-transform: uppercase; letter-spacing: .16em; font-size: .75rem; }
+    h1 { font-size: clamp(2rem, 6vw, 3rem); margin: 12px 0; }
+    .intro, footer { color: #afbeca; line-height: 1.6; }
+    .cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; margin: 32px 0; }
+    article { border: 1px solid #344250; background: #192530; border-radius: 18px; padding: 28px; }
+    h2 { font-size: 1rem; font-weight: 500; margin: 0 0 20px; }
+    .value { font-size: clamp(2.3rem, 7vw, 3.8rem); font-variant-numeric: tabular-nums; font-weight: 650; }
+    .unit { font-size: 1.25rem; color: #afbeca; }
+    .temperature { color: #f2a3df; }
+    .humidity { color: #80dfeb; }
+    #status { color: #efca7c; }
+    #status[data-state="live"] { color: #93e4b7; }
+    #status[data-state="error"] { color: #ffab9e; }
+    body.stale .value { opacity: .45; }
+    footer { font-size: .85rem; }
+    @media (max-width: 480px) { .cards { grid-template-columns: 1fr; } body { padding-top: 28px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">ESP32 · SHT30</div>
+    <h1>Room monitor</h1>
+    <p class="intro">Temperature and relative humidity, updated every two seconds.</p>
+    <div class="cards">
+      <article>
+        <h2>Temperature</h2>
+        <span id="temperature" class="value temperature">—</span> <span class="unit">°C</span>
+      </article>
+      <article>
+        <h2>Relative humidity</h2>
+        <span id="humidity" class="value humidity">—</span> <span class="unit">% RH</span>
+      </article>
+    </div>
+    <p id="status" role="status" aria-live="polite">Connecting to sensor…</p>
+    <footer id="updated">Waiting for the first reading.</footer>
+    <noscript>Enable JavaScript to display live readings.</noscript>
+  </main>
+  <script>
+    const temperature = document.getElementById('temperature');
+    const humidity = document.getElementById('humidity');
+    const status = document.getElementById('status');
+    const updated = document.getElementById('updated');
+
+    async function refresh() {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch('/api/readings', { cache: 'no-store', signal: controller.signal });
+        if (!response.ok) throw new Error('Readings unavailable');
+        const data = await response.json();
+        if (![data.temperature_c, data.humidity_pct, data.age_ms].every(Number.isFinite)) {
+          throw new Error('Invalid readings');
+        }
+        if (data.age_ms > 6000) throw new Error('Sensor readings are stale');
+        temperature.textContent = data.temperature_c.toFixed(2);
+        humidity.textContent = data.humidity_pct.toFixed(2);
+        status.textContent = '● Live';
+        status.dataset.state = 'live';
+        document.body.classList.remove('stale');
+        updated.textContent = 'Last reading: ' + new Date(Date.now() - data.age_ms).toLocaleTimeString();
+      } catch (error) {
+        status.textContent = 'Readings unavailable — reconnecting…';
+        status.dataset.state = 'error';
+        document.body.classList.add('stale');
+      } finally {
+        clearTimeout(timeout);
+        setTimeout(refresh, 2000);
+      }
+    }
+    refresh();
+  </script>
+</body>
+</html>
