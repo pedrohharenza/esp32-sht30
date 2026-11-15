@@ -1,0 +1,35 @@
+ESP32 temperature/humidity monitor: static RAM investigation
+ELF: .pio\build\esp32dev\firmware.elf
+ELF SHA256: fc72e08d5fc2f0543e806482789171a511cbb9b052116cbf4ed37216aca14523
+Runtime heap has NOT been measured. All sizes below are bytes or KiB (1024 bytes).
+Static DRAM: 50,112 bytes (48.94 KiB)
+IRAM code/vectors/alignment: 97,184 bytes (94.91 KiB)
+History record: 12 bytes; history array: 17,280 bytes
+Other static DRAM: 32,832 bytes
+Static DRAM linker region: 180,736 bytes
+
+Eligible 8-bit heap regions BEFORE allocator metadata, startup allocations,
+task stacks, Wi-Fi, TCP/IP, HTTP, ADC and other runtime allocations:
+  0x3ffae6e0..0x3ffb0000:   6,432 bytes (DRAM, startup_stack=False)
+  0x3ffbc3c0..0x3ffe0000: 146,496 bytes (DRAM, startup_stack=False)
+  0x3ffe0440..0x3ffe3f20:  15,072 bytes (D/IRAM, startup_stack=True)
+  0x3ffe4350..0x40000000: 113,840 bytes (D/IRAM, startup_stack=True)
+  Total theoretical region space: 281,840 bytes
+
+24-hour retention with existing 12-byte records and full history snapshot:
+Interval  Points  Array KiB  Array+copy KiB  Static KiB  Region test
+    60s    1440      16.88           33.75       48.94  Fits geometry ONLY; needs runtime measurement
+    30s    2880      33.75           67.50       65.81  Fits geometry ONLY; needs runtime measurement
+    20s    4320      50.62          101.25       82.69  Fits geometry ONLY; needs runtime measurement
+    16s    5400      63.28          126.56       95.34  Fits geometry ONLY; needs runtime measurement
+    15s    5760      67.50          135.00       99.56  Fits geometry ONLY; needs runtime measurement
+    10s    8640     101.25          202.50      133.31  Fits geometry ONLY; needs runtime measurement
+     9s    9600     112.50          225.00      144.56  FAIL: snapshot cannot fit any region
+     8s   10800     126.56          253.12      158.62  FAIL: snapshot cannot fit any region
+     5s   17280     202.50          405.00      234.56  FAIL: static DRAM link limit
+     2s   43200     506.25         1012.50      538.31  FAIL: static DRAM link limit
+
+Limits: region sizes are upper bounds, not free heap. Passing this table
+does not establish safety. Wi-Fi traffic, sockets and fragmentation matter.
+Rows assume true requested sample spacing; the current ~2-second sensor
+loop rounds odd intervals up in practice, and execution adds some drift.

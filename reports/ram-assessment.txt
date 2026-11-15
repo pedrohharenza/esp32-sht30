@@ -1,0 +1,178 @@
+ESP32 temperature/humidity monitor RAM assessment
+Investigation date: 2026-11-15
+
+CONCLUSION
+
+Assuming 24-hour retention and the existing full-snapshot implementation:
+- 30 seconds is a conservative candidate to test first, not a certified limit.
+- 15 seconds is plausible from the memory layout but requires runtime validation.
+- 10 seconds has very little budget for runtime services and reserve; avoid it
+  with this design unless measurements and/or optimizations justify it.
+- True 9-second or faster 24-hour history cannot fit the full snapshot in the
+  eligible heap regions with this layout. At 5 seconds, static RAM also exceeds
+  the linker region.
+There is no measured safe maximum yet: the user confirmed the ESP32 is offline.
+
+EVIDENCE AND SCOPE
+
+Inspected src/main.c, src/monitor_wifi.c, src/monitor_web.c, src/web/index.html,
+the existing firmware.elf and linker map, generated build configuration, and
+the installed ESP-IDF 5.5 memory allocator layout and HTTP server defaults.
+The existing ELF was last written on November 13. These are measurements of
+that local compiled artifact, not proof of which image is flashed on the board.
+The current source uses a 1,440-record ring, 60-second sampling and 24-hour
+retention. Bluetooth and PSRAM are disabled in the generated configuration.
+The pre-existing sdkconfig.esp32dev modifications were left untouched.
+
+EXACT BUILD NUMBERS (KiB = 1024 bytes)
+
+Initialized static DRAM (.dram0.data): 16,168 bytes.
+Zero-initialized static DRAM (.dram0.bss): 33,944 bytes.
+Total static DRAM: 50,112 bytes = 48.94 KiB.
+History array included in this total: 17,280 bytes = 16.88 KiB.
+All other static DRAM: 32,832 bytes = 32.06 KiB.
+IRAM code, vectors and alignment: 97,184 bytes = 94.91 KiB.
+Static DRAM linker region: 180,736 bytes = 176.50 KiB.
+
+There are 281,840 bytes (275.23 KiB) of eligible 8-bit heap REGION SPACE after
+static/ROM reservations, before allocator metadata and runtime allocations.
+This is an upper bound, NOT free RAM after Wi-Fi starts. Unused instruction-only
+RAM cannot be treated as interchangeable byte-addressable history storage.
+
+The linked record type was verified using DWARF: uint32 timestamp + two floats,
+12 bytes total. Every history request mallocs a complete 17,280-byte copy today,
+even if the ring is not full. It is freed after transmission. The synchronous
+HTTP handler means this is one active snapshot, not one per open browser tab.
+Multiple clients still add socket/buffer pressure and more sequential requests.
+JSON is streamed through a 1,024-byte stack buffer; there is no separate complete
+JSON response allocated in ESP32 RAM. Graph SVG rendering happens in the browser.
+
+WHY WI-FI CANNOT BE REDUCED TO ONE EXACT BUILD-TIME NUMBER
+
+The previous 100-200 KB answer was a rough budget, not a measurement. Some Wi-Fi
+code and static state are already included in the IRAM/static DRAM totals above.
+Do not add a vague Wi-Fi total on top of those totals as if it were all new heap.
+
+Configuration: 10 static RX buffers, at 1,600 bytes each, allocated during driver
+initialization (16,000 bytes = 15.625 KiB, before bookkeeping). Up to 32 dynamic
+RX and 32 dynamic TX buffers are allowed. Their count is a limit, not an idle
+reservation; RX sizes depend on received frame lengths. Roughly 100 KiB of
+dynamic payload buffers could be present if both sets held near-1,600-byte frames;
+this is an illustration, not an exact worst-case bound for the whole stack.
+
+Additional allocations include driver/control structures, security handshake
+state, network interfaces, NVS, FreeRTOS tasks, lwIP packets, sockets and HTTP.
+The configured TCP send buffer and receive window are each 5,760 bytes per TCP
+connection; window sizes are not necessarily eagerly allocated in full.
+HTTP allows 7 client sockets and has a 4,096-byte task stack. The sensor/main
+task stack is 3,584 bytes; TCP/IP task 3,072; system event task 2,304; timer task
+3,584; IPC tasks 1,024 each; idle tasks 1,536 each. These are not a complete
+allocation inventory and do not include task-control-block overhead.
+
+CAPACITY AND HARD LIMITS
+
+See ram-footprint.txt for generated numbers and the ELF SHA256.
+For interval T seconds: N = ceil(86400/T), ring = 12*N bytes;
+history peak = 24*N bytes (ring plus snapshot), excluding other allocations.
+
+Interval    Points    Ring KiB    Ring + snapshot KiB
+60 sec       1440       16.875          33.750
+30 sec       2880       33.750          67.500
+20 sec       4320       50.625         101.250
+15 sec       5760       67.500         135.000
+10 sec       8640      101.250         202.500
+ 9 sec       9600      112.500         225.000
+ 5 sec      17280      202.500         405.000
+
+This model expands the static ring and recomputes eligible regions from the
+actual ELF's soc_memory_regions and reserved_region_* descriptors. It follows
+ESP-IDF's rule that adjacent regions merge only with the same memory type and
+startup-stack status. With a 9-second ring, the biggest possible remaining
+region is 113,840 bytes, smaller than its 115,200-byte snapshot. This fails even
+before heap metadata, fragmentation, tasks or Wi-Fi. Faster intervals do not
+improve that constraint. With a 5-second ring the total static DRAM would be
+240,192 bytes, exceeding the 180,736-byte linker region as well.
+Passing this geometry check does NOT prove a working or safe firmware.
+
+LIVE VALIDATION WHEN THE BOARD IS AVAILABLE
+
+tools/ram_probe.h contains an optional logging helper, not enabled in production.
+Its syntax was checked with the project's Xtensa compiler and compilation flags.
+Include it in relevant C files and call monitor_ram_probe("stage") outside locks:
+1. At app_main entry, before Wi-Fi startup.
+2. Before/after esp_wifi_init and after esp_wifi_start.
+3. After IP acquisition and HTTP server startup.
+4. Immediately after successful history snapshot malloc, before sample_lock.
+5. After transmitting/freeing the snapshot and periodically during normal use.
+
+The probe reports internal 8-bit heap allocated/free bytes, lifetime minimum
+free bytes, largest allocatable free block, and the calling task's minimum spare
+stack in bytes. Heap allocated bytes exclude static RAM and instruction RAM.
+The lifetime minimum is a conservative sum of per-region low-water marks, not
+necessarily one simultaneous global low point. Logging itself has small costs.
+
+First measure the current build, then the candidate interval. Exercise full
+24-hour-sized responses, multiple browser tabs, slow responses and Wi-Fi
+disconnect/reconnect. A short test with an almost-empty history does not fully
+exercise network pressure. A full ring can be seeded in a diagnostic build;
+otherwise run until full and continue through wraparound. Check for allocation
+failures, HTTP errors, resets, decreasing heap, and stack exhaustion.
+
+Proposed engineering acceptance target: retain at least 64 KiB minimum internal
+8-bit heap during these tests, with the snapshot allocated, and comfortable
+largest-block headroom above the snapshot size before each request. This is a
+chosen reserve, NOT an Espressif guarantee. For 15 seconds the snapshot alone
+requires a contiguous 69,120 bytes; target at least another 8-16 KiB of largest-
+block margin before allocation, in addition to the total-free-heap criterion.
+Also test reconnection while a slow history response keeps the snapshot alive.
+
+As a preliminary screening calculation, relative to the existing 60-second
+build while its snapshot is allocated, peak history grows by:
+30 seconds: +33.75 KiB; 20 seconds: +67.50 KiB;
+15 seconds: +101.25 KiB; 10 seconds: +168.75 KiB.
+For the proposed 64 KiB reserve, current-build minimum heap should therefore
+exceed approximately 97.75 / 131.50 / 165.25 / 232.75 KiB respectively.
+These thresholds do not account for changed allocation placement, fragmentation,
+longer network responses or additional traffic; candidates still need testing.
+
+OTHER CHANGES NEEDED FOR FINER RESOLUTION
+
+main.c waits 2,000 ms after reading/logging. monitor_web_update records only on
+sensor updates and resets last_history_seconds to the current time. A nominal
+15-second interval therefore tends to become about 16 seconds, with timing drift.
+Use an appropriate sampling schedule if true 15-second spacing is required.
+The browser validates samples.length <= 1440, so increasing the ring alone will
+eventually make the browser reject history. Update that limit, interval_seconds
+metadata (currently hardcoded 60), refresh timer, and 90-second graph gap cutoff
+consistently. The graph fetch interval and retention sample interval are separate.
+Polling every 15 seconds while keeping 60-second samples does not enlarge the ring.
+
+WAYS TO INCREASE RESOLUTION WITH LESS RAM
+
+- 15 seconds with 6-hour retention: same 1,440 points and history RAM as today.
+- 8-byte records (32-bit timestamp plus two signed 16-bit readings scaled by 100):
+  15 seconds/24 hours uses 45 KiB ring + 45 KiB snapshot = 90 KiB. Round and validate
+  values before conversion. This preserves displayed 0.01 precision, not every
+  bit of the original floats, and does not improve sensor accuracy.
+- Keep 15-second points for the newest hour, then one-minute buckets for the
+  older 23 hours: about 1,620 records and 38 KiB ring+snapshot. Define whether old
+  buckets store the last reading, average, or extrema; each has different meaning.
+- Replace the full snapshot with bounded chunks and sequence validation. This
+  can save most of the temporary copy, but must handle ring overwrite correctly
+  and must never hold sample_lock during network transmission.
+
+VALIDATION PERFORMED
+
+Ran tools/analyze_ram.py against the actual ELF; confirmed section totals with
+xtensa-esp32-elf-size -A, history symbol size in the linker map, and struct size
+in DWARF. Inspected ESP-IDF's region reservation/coalescing logic. Syntax-checked
+the optional RAM probe with the installed compiler. No firmware was changed,
+rebuilt, flashed, or run on hardware during this investigation.
+
+REFERENCES
+
+https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32/api-guides/wifi.html
+https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32/api-reference/system/mem_alloc.html
+Local ESP-IDF: components/heap/port/esp32/memory_layout.c
+Local ESP-IDF: components/heap/heap_caps_init.c
+Local ESP-IDF: components/esp_http_server/include/esp_http_server.h

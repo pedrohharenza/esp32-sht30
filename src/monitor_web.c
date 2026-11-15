@@ -18,9 +18,9 @@ static float latest_humidity;
 static int64_t sample_time_us;
 static bool sample_available;
 
-#define HISTORY_CAPACITY 1440
-#define HISTORY_INTERVAL_SECONDS 60
+#define HISTORY_INTERVAL_SECONDS 20
 #define HISTORY_RETENTION_SECONDS (24 * 60 * 60)
+#define HISTORY_CAPACITY (HISTORY_RETENTION_SECONDS / HISTORY_INTERVAL_SECONDS)
 
 typedef struct {
     uint32_t uptime_seconds;
@@ -28,7 +28,7 @@ typedef struct {
     float humidity_pct;
 } history_sample_t;
 
-// About 17 KB in RAM; populated by the sensor task even without HTTP clients.
+// About 51 KiB in RAM; populated by the sensor task even without HTTP clients.
 static history_sample_t history[HISTORY_CAPACITY];
 static size_t history_next;
 static size_t history_count;
@@ -109,7 +109,7 @@ static esp_err_t history_handler(httpd_req_t *request)
     httpd_resp_set_type(request, "application/json");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
     esp_err_t result = httpd_resp_sendstr_chunk(request,
-        "{\"interval_seconds\":60,\"samples\":[");
+        "{\"interval_seconds\":20,\"samples\":[");
     // Batch records to avoid one TCP write per sample on a full day's history.
     char chunk[1024];
     size_t used = 0;

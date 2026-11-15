@@ -89,6 +89,7 @@
     const timeRange = document.getElementById('time-range');
     let history = [];
     const retentionMs = 24 * 60 * 60 * 1000;
+    const historyIntervalMs = 20 * 1000;
     const historyStatus = document.getElementById('history-status');
 
     function drawChart(id, key, color, label, now) {
@@ -118,7 +119,7 @@
       }
       let path = '';
       points.forEach((point, index) => {
-        const gap = index === 0 || point.time - points[index - 1].time > 90000;
+        const gap = index === 0 || point.time - points[index - 1].time > historyIntervalMs * 1.5;
         path += `${gap ? 'M' : 'L'}${x(point.time).toFixed(2)},${y(point[key]).toFixed(2)} `;
       });
       markup += `<path d="${path}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round"/>`;
@@ -152,7 +153,7 @@
         const response = await fetch('/api/history', { cache: 'no-store', signal: controller.signal });
         if (!response.ok) throw new Error('History unavailable');
         const data = await response.json();
-        if (!Array.isArray(data.samples) || data.samples.length > 1440 ||
+        if (!Array.isArray(data.samples) || data.samples.length > retentionMs / historyIntervalMs ||
             !data.samples.every(row => Array.isArray(row) && row.length === 3 &&
               row.every(Number.isFinite) && row[0] >= 0 && row[0] < 86400)) {
           throw new Error('Invalid history');
@@ -165,7 +166,7 @@
           ? ''
           : 'Waiting for the first stored reading…';
         historyStatus.hidden = history.length > 0;
-        retryMs = 60000;
+        retryMs = historyIntervalMs;
       } catch (error) {
         historyStatus.textContent = 'History update failed — showing previously loaded data. Retrying…';
         historyStatus.hidden = false;
